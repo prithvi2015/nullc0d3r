@@ -3,184 +3,229 @@ import json
 import requests
 import argparse
 import os
+import math
 
+# Utility to load JSON data
 def load_json(file_path_or_url):
-    """ Load JSON from a file or URL """
     if file_path_or_url.startswith("http"):
-        try:
-            response = requests.get(file_path_or_url)
-            response.raise_for_status()
-            return response.json()
-        except requests.RequestException as e:
-            print("❌ Error: Failed to fetch JSON from URL: {}".format(e))
-            return None
+        response = requests.get(file_path_or_url)
+        response.raise_for_status()
+        return response.json()
+    elif os.path.exists(file_path_or_url):
+        with open(file_path_or_url, "r") as f:
+            return json.load(f)
     else:
-        if not os.path.exists(file_path_or_url):
-            print("❌ Error: File not found at {}".format(file_path_or_url))
-            return None
-        try:
-            with open(file_path_or_url, "r") as file:
-                return json.load(file)
-        except Exception as e:
-            print("❌ Error: Unable to read the JSON file: {}".format(e))
-            return None
+        print(u"❌ Error: Path not found - {}".format(file_path_or_url))
+        return None
 
+# Detect the type of API schema
 def detect_file_type(json_data):
-    """ Detect whether the file is OpenAPI 3.x, Swagger 2.0, or a Postman Collection """
     if "openapi" in json_data:
         return "openapi3"
     elif "swagger" in json_data:
         return "swagger2"
     elif "info" in json_data and "item" in json_data:
         return "postman"
+    elif json_data.get("data", {}).get("__schema"):
+        return "graphql"
     return None
 
-# ----------- OpenAPI & Swagger Analysis ----------- #
+# Resolve JSON reference deeply
+def resolve_ref(ref, full_schema):
+    parts = ref.strip('#/').split('/')
+    resolved = full_schema
+    for part in parts:
+        resolved = resolved.get(part, {})
+    return resolved
 
-def analyze_openapi(file_path_or_url, version):
-    """ Perform full OpenAPI analysis on a given file or URL """
-    openapi_data = load_json(file_path_or_url)
-    if not openapi_data:
-        return {"Error": "Failed to load OpenAPI data. Check the file path or URL."}
+# Recursive extraction of schema properties
+def extract_schema_properties(schema, full_schema, unique_params, seen_refs=None):
+    if seen_refs is None:
+        seen_refs = set()
 
-    total_endpoints = len(openapi_data.get("paths", {}))
-    method_counts = {}
+    if schema is None or not isinstance(schema, dict):
+        return
 
-    unique_parameters = set()
-    total_parameters = 0
-    total_body_parameters = 0
-    deep_parameters = set()
+    if "$ref" in schema:
+        ref_id = schema["$ref"]
+        if ref_id in seen_refs:
+            return
+        seen_refs.add(ref_id)
+        ref_schema = resolve_ref(ref_id, full_schema)
+        extract_schema_properties(ref_schema, full_schema, unique_params, seen_refs)
 
-    for path, methods in openapi_data.get("paths", {}).items():
-        for method, details in methods.items():
-            method_counts[method] = method_counts.get(method, 0) + 1
+    if "properties" in schema:
+        for prop, prop_spec in schema["properties"].items():
+            unique_params.add(prop)
+            extract_schema_properties(prop_spec, full_schema, unique_params, seen_refs)
 
-            # Extract parameters
-            if "parameters" in details:
-                for param in details["parameters"]:
-                    if "name" in param:
-                        unique_parameters.add(param["name"])
-                total_parameters += len(details["parameters"])
+    for composite in ["allOf", "anyOf", "oneOf"]:
+        if composite in schema:
+            for subschema in schema[composite]:
+                extract_schema_properties(subschema, full_schema, unique_params, seen_refs)
 
-            # Extract body parameters
-            if "requestBody" in details:
-                content = details["requestBody"].get("content", {})
-                for media_type, media_details in content.items():
-                    if "schema" in media_details:
-                        schema = media_details["schema"]
-                        if "$ref" in schema:
-                            deep_parameters.add(schema["$ref"].split("/")[-1])
-                        total_body_parameters += 1
-
-    analysis_results = {
-        "OpenAPI Version": version,
-        "Total API Endpoints": total_endpoints,
-        "HTTP Methods Count": method_counts,
-        "Total Parameters (including body parameters)": total_parameters + total_body_parameters,
-        "Total Body Parameters": total_body_parameters,
-        "Deep Schema Parameters": len(deep_parameters),
-        "Unique Parameters (Including Deep Analysis)": len(unique_parameters.union(deep_parameters)),
-        "List of Unique Parameters": list(unique_parameters.union(deep_parameters)),
-    }
-
-    return analysis_results
-
-# ----------- Postman Collection Analysis ----------- #
-
-def extract_query_params(url):
-    """ Extract query parameters from Postman Collection requests """
-    if "query" in url:
-        return {param["key"] for param in url["query"]}
-    return set()
-
-def extract_body_params(body):
-    """ Extract body parameters from Postman Collection requests """
-    if body and body.get("mode") == "raw" and body.get("raw"):
-        try:
-            parsed_body = json.loads(body["raw"])
-            return set(parsed_body.keys()) if isinstance(parsed_body, dict) else set()
-        except ValueError:
-            return set()  # Ignore non-JSON body
-    return set()
-
-def analyze_postman_collection(postman_data):
-    """ Perform analysis on a Postman Collection, including nested folders """
+# Analysis for OpenAPI and Swagger schemas
+def analyze_openapi(json_data, version):
+    endpoints = len(json_data.get("paths", {}))
     total_requests = 0
-    http_methods_count = {}
-    unique_parameters = set()
-    total_query_parameters = 0
-    total_body_parameters = 0
+    methods = {}
+    unique_params = set()
 
-    def process_requests(items, total_requests, total_query_parameters, total_body_parameters):
-        """ Recursively process requests, handling folders """
-        for item in items:
-            if "item" in item:  # If item is a folder, recursively process it
-                total_requests, total_query_parameters, total_body_parameters = process_requests(
-                    item["item"], total_requests, total_query_parameters, total_body_parameters
-                )
-                continue
+    for path, path_item in json_data.get("paths", {}).items():
+        for method, spec in path_item.items():
+            method_upper = method.upper()
+            methods[method_upper] = methods.get(method_upper, 0) + 1
+            total_requests += 1  # Increment request count
 
-            if "request" not in item:  # Skip invalid items
-                continue
+            for param in spec.get("parameters", []):
+                if "$ref" in param:
+                    resolved_param = resolve_ref(param["$ref"], json_data)
+                    if "name" in resolved_param:
+                        unique_params.add(resolved_param["name"])
+                elif "name" in param:
+                    unique_params.add(param["name"])
 
-            total_requests += 1
-            method = item["request"]["method"]
+            if "requestBody" in spec:
+                content = spec["requestBody"].get("content", {})
+                for media_type in content.values():
+                    schema = media_type.get("schema", {})
+                    extract_schema_properties(schema, json_data, unique_params)
 
-            # Count HTTP methods
-            http_methods_count[method] = http_methods_count.get(method, 0) + 1
-
-            # Extract query parameters
-            unique_parameters.update(extract_query_params(item["request"]["url"]))
-            total_query_parameters += len(extract_query_params(item["request"]["url"]))
-
-            # Extract body parameters
-            if "body" in item["request"]:
-                unique_parameters.update(extract_body_params(item["request"]["body"]))
-                total_body_parameters += len(extract_body_params(item["request"]["body"]))
-
-        return total_requests, total_query_parameters, total_body_parameters
-
-    # Start processing requests, handling folders
-    total_requests, total_query_parameters, total_body_parameters = process_requests(
-        postman_data.get("item", []), total_requests, total_query_parameters, total_body_parameters
-    )
+            testing_days = max(1, (total_requests + 3) // 4)
 
     return {
+        "API Version": version,
         "Total Requests": total_requests,
-        "HTTP Methods Count": http_methods_count,
-        "Total Query Parameters": total_query_parameters,
-        "Total Body Parameters": total_body_parameters,
-        "Unique Parameters (Including Query & Body)": len(unique_parameters),
-        "List of Unique Parameters": list(unique_parameters),
+        "Testing Days": testing_days,
+        "Total Endpoints": endpoints,
+        "HTTP Methods": methods,
+        "Unique Parameters (Deep Analysis)": len(unique_params)
     }
 
-# ----------- Main Analysis Function ----------- #
+# Analysis for Postman collections
+def analyze_postman_collection(postman_data):
+    def process_requests(items, counts):
+        for item in items:
+            if "item" in item:
+                process_requests(item["item"], counts)
+                continue
+            if "request" not in item:
+                continue
+            counts["Total Requests"] += 1
+            method = item["request"].get("method", "UNKNOWN")
+            counts["HTTP Methods Count"][method] = counts["HTTP Methods Count"].get(method, 0) + 1
 
-def analyze_json(file_path_or_url):
-    """ Perform full analysis on OpenAPI or Postman Collection """
-    json_data = load_json(file_path_or_url)
-    if not json_data:
-        return {"Error": "Failed to load JSON data. Check the file path or URL."}
+            if "url" in item["request"] and "query" in item["request"]["url"]:
+                counts["Unique Parameters"].update(
+                    param["key"] for param in item["request"]["url"]["query"]
+                )
+                counts["Total Query Parameters"] += len(item["request"]["url"]["query"])
 
-    file_type = detect_file_type(json_data)
-    
-    if file_type in ["openapi3", "swagger2"]:
-        return analyze_openapi(file_path_or_url, file_type)
-    elif file_type == "postman":
-        return analyze_postman_collection(json_data)
+            if "body" in item["request"]:
+                counts["Total Body Parameters"] += 1
+
+    counts = {
+        "Total Requests": 0,
+        "HTTP Methods Count": {},
+        "Total Query Parameters": 0,
+        "Total Body Parameters": 0,
+        "Unique Parameters": set()
+    }
+
+    process_requests(postman_data.get("item", []), counts)
+
+    counts["Unique Parameters"] = len(counts["Unique Parameters"])
+    counts["Testing Days"] = max(1, (counts["Total Requests"] + 3) // 4)
+    return counts
+
+# Analysis for GraphQL introspection schema
+def analyze_graphql(schema_json):
+    schema_info = schema_json.get("data", {}).get("__schema", {})
+    types = schema_info.get("types", [])
+
+    query_type_name = schema_info.get("queryType", {}).get("name") if schema_info.get("queryType") else None
+    mutation_type_name = schema_info.get("mutationType", {}).get("name") if schema_info.get("mutationType") else None
+    subscription_type_name = schema_info.get("subscriptionType", {}).get("name") if schema_info.get("subscriptionType") else None
+
+    query_count = mutation_count = subscription_count = 0
+
+    for t in types:
+        type_name = t.get("name", "")
+        fields = t.get("fields", [])
+
+        if type_name == query_type_name:
+            query_count += len(fields) if fields else 0
+        elif type_name == mutation_type_name:
+            mutation_count += len(fields) if fields else 0
+        elif type_name == subscription_type_name:
+            subscription_count += len(fields) if fields else 0
+
+    total_types = len(types)
+    total_fields = sum(len(t.get("fields") or []) for t in types)
+    total_requests = query_count + mutation_count + subscription_count
+    testing_days = max(1, (total_requests + 3) // 4)
+
+    return {
+        "Queries": query_count,
+        "Mutations": mutation_count,
+        "Subscriptions": subscription_count,
+        "Total Types": total_types,
+        "Total Fields": total_fields,
+        "Total Requests": total_requests,
+        "Testing Days": testing_days
+    }
+
+
+
+
+# GraphQL introspection via endpoint
+def graphql_introspection_check(endpoint):
+    introspection_query = '{"query":"query IntrospectionQuery { __schema { queryType { name } mutationType { name } subscriptionType { name } types { name fields { name args { name } } } } }"}'
+    headers = {'Content-Type': 'application/json'}
+
+    print("Fetching GraphQL schema from {}".format(endpoint))
+    response = requests.post(endpoint, data=introspection_query, headers=headers)
+
+    if response.status_code == 200:
+        schema_json = response.json()
+        if schema_json.get("data", {}).get("__schema"):
+            print("✅ Introspection enabled via POST")
+            return analyze_graphql(schema_json)
+        else:
+            print("❌ Introspection query succeeded but no schema found.")
     else:
-        return {"Error": "Unknown API specification format."}
+        print("❌ GraphQL introspection failed with status code: {}".format(response.status_code))
 
-def main():
-    """ Command-line interface for analyzing OpenAPI or Postman JSON files """
-    parser = argparse.ArgumentParser(description="Analyze an OpenAPI JSON or Postman Collection file.")
-    parser.add_argument("input", type=str, help="Path to the JSON file or URL")
+    return {"Error": "GraphQL introspection not enabled via POST"}
+
+# Main function explicitly handling GraphQL endpoints and files
+def main(input_file):
+    if input_file.startswith("http") and "graphql" in input_file.lower():
+        results = graphql_introspection_check(input_file)
+    else:
+        json_data = load_json(input_file)
+        if not json_data:
+            return
+
+        file_type = detect_file_type(json_data)
+
+        if file_type in ["openapi3", "swagger2"]:
+            results = analyze_openapi(json_data, file_type)
+        elif file_type == "postman":
+            results = analyze_postman_collection(json_data)
+        elif file_type == "graphql":
+            results = analyze_graphql(json_data)
+        else:
+            results = {"Error": "Unknown schema type"}
+
+    print("\nAPI Analysis Results:\n")
+    for key, value in results.items():
+        print("{}: {}".format(key, value))
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description="API Schema Analyzer")
+    parser.add_argument("input", type=str, help="Path to the API schema file (JSON) or GraphQL endpoint URL")
     args = parser.parse_args()
-    
-    analysis_results = analyze_json(args.input)
-    print("\n📊 API Analysis Results:\n")
-    for i, (key, value) in enumerate(analysis_results.items(), start=1):
-        print("{}. {}: {}".format(i, key, value))
 
-if __name__ == "__main__":
-    main()
+    main(args.input)
+
